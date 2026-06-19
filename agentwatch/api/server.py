@@ -53,6 +53,7 @@ from agentwatch.replay.counterfactual import CounterfactualEngine, Counterfactua
 from agentwatch.replay.engine import ReplayEngine
 from agentwatch.rollback.engine import RollbackEngine
 from agentwatch.scoring.confidence import ConfidenceScorer
+from agentwatch.telemetry.execution_logger import ExecutionLogger
 from agentwatch.tracing.collector import TraceCollector
 
 logger = logging.getLogger(__name__)
@@ -234,6 +235,7 @@ _alerting = AlertingEngine(
         pagerduty_webhook_url=os.getenv("PAGERDUTY_WEBHOOK_URL"),
     )
 )
+_execution_loggers: dict[str, ExecutionLogger] = {}
 _ws_clients: list[WebSocket] = []
 
 
@@ -611,6 +613,9 @@ async def create_session(
 ) -> dict[str, Any]:
     _limiter.check(_rate_limit_key(request, "w"), RATE_WRITE, request)
     _collector.register_session(session)
+    _execution_loggers[session.session_id] = ExecutionLogger(
+        session.agent_id, session.session_id, session.session_id
+    )
     await _pg_write_session(session)
     return {"status": "registered", "session": session.model_dump(mode="json")}
 
@@ -652,6 +657,30 @@ async def ingest_event(
     _auth: None = Depends(_require_api_key),
 ) -> dict[str, Any]:
     _limiter.check(_rate_limit_key(request, "w"), RATE_WRITE, request)
+
+    logger_inst = _execution_loggers.get(event.session_id)
+    if logger_inst:
+        if event.event_type == EventType.TOOL_CALL and event.tool_call:
+            logger_inst.log_step(
+                event.tool_call.tool_name,
+                {"raw_command": event.tool_call.raw_command},
+            )
+        elif event.event_type == EventType.TOOL_RESULT and event.tool_result:
+            latency_ms = event.duration_ms or 0
+            logger_inst.log_step(
+                f"tool_result_{event.tool_result.tool_name}",
+                {
+                    "status": "success" if not event.tool_result.error else "error",
+                    "duration_ms": latency_ms,
+                },
+            )
+        elif event.event_type == EventType.SESSION_END:
+            duration_ms = event.duration_ms or 0
+            logger_inst.log_execution_complete(
+                event.status.value if event.status else "unknown",
+                duration_ms,
+            )
+
     await get_event_bus().publish(event)
     return {"status": "accepted", "event_id": event.event_id}
 
